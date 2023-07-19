@@ -7,11 +7,30 @@ use sn_transfers::wallet::LocalWallet;
 
 /// Returns a dbc with the requested number of tokens, for use by E2E test instances.
 pub async fn get_tokens_from_faucet(amount: Token, to: PublicAddress, client: &Client) -> Dbc {
-    send(load_faucet_wallet(client).await, amount, to, client).await
+    send(
+        load_faucet_wallet_from_genesis_wallet(client).await,
+        amount,
+        to,
+        client,
+    )
+    .await
 }
 
-/// Use the client to load the faucet wallet from the genesis DBC.
-pub async fn load_faucet_wallet(client: &Client) -> LocalWallet {
+/// Returns a dbc with the requested number of tokens to be transferred from genesis to another wallet.
+/// For use by the network churning test.
+pub async fn get_tokens_from_genesis_to_another_wallet(
+    genesis_wallet: LocalWallet,
+    amount: Token,
+    to: PublicAddress,
+    client: &Client,
+) -> Dbc {
+    send(genesis_wallet, amount, to, client).await
+}
+
+/// Use the client to load the faucet wallet from the genesis Wallet.
+/// With all balance transferred from the genesis_wallet to the faucet_wallet.
+pub async fn load_faucet_wallet_from_genesis_wallet(client: &Client) -> LocalWallet {
+    println!("Loading genesis...");
     let genesis_wallet = load_genesis_wallet().await;
 
     println!("Loading faucet...");
