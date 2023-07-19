@@ -205,13 +205,21 @@ impl Node {
                 if !cfg!(feature = "local-discovery") {
                     let network = self.network.clone();
                     let peers = self.initial_peers.clone();
+                    let node_event_sender = self.events_channel.clone();
+                    let mut first_peer = true;
                     let _handle = spawn(async move {
                         for addr in &peers {
+                            if first_peer {
+                                node_event_sender.broadcast(NodeEvent::AttemptingNetworkConnection);
+                                first_peer = false;
+                            }
                             if let Err(err) = network.dial(addr.clone()).await {
                                 tracing::error!("Failed to dial {addr}: {err:?}");
                             };
                         }
                     });
+                } else {
+                    self.events_channel.broadcast(NodeEvent::AttemptingNetworkConnection);
                 }
             }
             NetworkEvent::NatStatusChanged(status) => {

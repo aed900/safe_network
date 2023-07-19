@@ -25,7 +25,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     process::Command,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::{
     fs::File,
@@ -296,6 +296,25 @@ fn monitor_node_events(mut node_events_rx: NodeEventsReceiver, ctrl_tx: mpsc::Se
     let _handle = tokio::spawn(async move {
         loop {
             match node_events_rx.recv().await {
+                Ok(NodeEvent::AttemptingNetworkConnection) => {
+                    Marker::AttemptingNetworkConnection.log();
+                    trace!("Attempting to connect to the network: dialing initial peers");
+                    let inactivity_timeout = Instant::now();
+
+                    loop {
+                        if inactivity_timeout.elapsed() >= Duration::from_secs(60) {
+                            Marker::NetworkConnectionTimingOut.log();
+                            trace!("Attempt to dial initial peers and connect to the network is timing out after {:?}", inactivity_timeout);
+                        }
+
+                        match node_events_rx.recv().await {
+                            Ok(NodeEvent::ConnectedToNetwork) => {
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
                 Ok(NodeEvent::ConnectedToNetwork) => Marker::NodeConnectedToNetwork.log(),
                 Ok(NodeEvent::ChannelClosed) | Err(RecvError::Closed) => {
                     if let Err(err) = ctrl_tx
