@@ -585,6 +585,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - using kad::record for dbc spend ops
 - *(CI)* dbc verfication during network churning test
 
+## [0.86.29](https://github.com/maidsafe/safe_network/compare/sn_node-v0.86.28...sn_node-v0.86.29) - 2023-07-19
+
+### Other
+- update dependencies
+
+## [0.86.30](https://github.com/maidsafe/safe_network/compare/sn_node-v0.86.29...sn_node-v0.86.30) - 2023-07-20
+
+### Other
+- cleanup error types
+
+## [0.86.31](https://github.com/maidsafe/safe_network/compare/sn_node-v0.86.30...sn_node-v0.86.31) - 2023-07-20
+
+### Other
+- update dependencies
+
+## [0.87.0](https://github.com/maidsafe/safe_network/compare/sn_node-v0.86.31...sn_node-v0.87.0) - 2023-07-21
+
+### Added
+- *(node)* fee output of payment proof to be required before storing chunks
+- *(protocol)* [**breaking**] make Chunks storage payment required
+
+### Fixed
+- *(ci)* run CI churn tests in windows with less churning frequency
+
+### Other
+- tokens transfers task in data_with_churn tests to use client apis instead of faucet helpers
+- adapt churn tests to make chunks storage payment
+
 ## v0.1.0 (2023-05-04)
 
 ### Chore

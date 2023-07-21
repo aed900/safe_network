@@ -28,9 +28,6 @@ use sn_transfers::{
 use std::collections::{BTreeSet, HashSet};
 use xor_name::XorName;
 
-// The max length of `Vec<SignedSpend>` that is permitted
-const MAX_SIGNED_SPENDS_LENGTH: usize = 2;
-
 impl Node {
     /// Validate and store a record to the RecordStore
     pub(crate) async fn validate_and_store_record(
@@ -178,12 +175,6 @@ impl Node {
         &mut self,
         signed_spends: Vec<SignedSpend>,
     ) -> Result<CmdOk, ProtocolError> {
-        // Prevents someone from crafting large Vec and slowing down nodes.
-        if signed_spends.len() > MAX_SIGNED_SPENDS_LENGTH {
-            warn!("Discarding incoming DbcSpend PUT as it contains more than {MAX_SIGNED_SPENDS_LENGTH} SignedSpends");
-            return Err(ProtocolError::MaxNumberOfSpendsExceeded);
-        }
-
         // make sure that the dbc_ids match
         let dbc_id = if let Some((first, elements)) = signed_spends.split_first() {
             let common_dbc_id = *first.dbc_id();
@@ -194,7 +185,7 @@ impl Node {
                 common_dbc_id
             } else {
                 let err = Err(ProtocolError::SpendNotStored(
-                    "The dbc_id of the provided Vec<SignedSpend> does not match".to_string(),
+                    "found SignedSpends with differing dbc_ids".to_string(),
                 ));
                 error!("{err:?}");
                 return err;
@@ -268,39 +259,38 @@ impl Node {
         &self,
         chunk_with_payment: &ChunkWithPayment,
     ) -> Result<(), ProtocolError> {
-        // TODO: temporarily payment proof is optional
-        if let Some(PaymentProof {
+        let PaymentProof {
             spent_ids,
             audit_trail,
             path,
-        }) = &chunk_with_payment.payment
-        {
-            let addr_name = *chunk_with_payment.chunk.name();
+        } = &chunk_with_payment.payment;
 
-            // We need to fetch the inputs of the DBC tx in order to obtain the root-hash and
-            // other info for verifications of valid payment.
-            // TODO: perform verifications in multiple concurrent tasks
-            let mut payment_tx = None;
-            for dbc_id in spent_ids.iter() {
-                let addr = DbcAddress::from_dbc_id(dbc_id);
-                let signed_spend = self.get_spend_from_network(addr).await?;
-                let spent_tx = signed_spend.spent_tx();
-                match payment_tx {
-                    Some(tx) if spent_tx != tx => {
-                        return Err(ProtocolError::PaymentProofTxMismatch(addr_name));
-                    }
-                    Some(_) => {}
-                    None => payment_tx = Some(spent_tx),
+        let addr_name = *chunk_with_payment.chunk.name();
+
+        // We need to fetch the inputs of the DBC tx in order to obtain the root-hash and
+        // other info for verifications of valid payment.
+        // TODO: perform verifications in multiple concurrent tasks
+        let mut payment_tx = None;
+        for dbc_id in spent_ids.iter() {
+            let addr = DbcAddress::from_dbc_id(dbc_id);
+
+            let signed_spend = self.get_spend_from_network(addr).await?;
+            let spent_tx = signed_spend.spent_tx();
+            match payment_tx {
+                Some(tx) if spent_tx != tx => {
+                    return Err(ProtocolError::PaymentProofTxMismatch(addr_name));
                 }
+                Some(_) => {}
+                None => payment_tx = Some(spent_tx),
             }
+        }
 
-            if let Some(tx) = payment_tx {
-                // Check if the fee output id and amount are correct, as well as verify
-                // the payment proof corresponds to the fee output.
-                verify_fee_output_and_proof(addr_name, &tx, audit_trail, path)?;
-            } else {
-                return Err(ProtocolError::PaymentProofWithoutInputs(addr_name));
-            }
+        if let Some(tx) = payment_tx {
+            // Check if the fee output id and amount are correct, as well as verify
+            // the payment proof corresponds to the fee output.
+            verify_fee_output_and_proof(addr_name, &tx, audit_trail, path)?;
+        } else {
+            return Err(ProtocolError::PaymentProofWithoutInputs(addr_name));
         }
 
         Ok(())
@@ -315,7 +305,7 @@ impl Node {
         let reg_addr = register.address();
         if let Err(e) = register.verify() {
             error!("Register with addr {reg_addr:?} is invalid: {e:?}");
-            return Err(ProtocolError::InvalidRegister(*reg_addr));
+            return Err(ProtocolError::RegisterInvalid(*reg_addr));
         }
 
         // if we don't have it locally return it
@@ -453,14 +443,14 @@ impl Node {
 
                 // check the spend
                 if let Err(e) = signed_spend.verify(signed_spend.spent_tx_hash()) {
-                    return Err(ProtocolError::InvalidSpendSignature(format!(
+                    return Err(ProtocolError::SpendSignatureInvalid(format!(
                         "while verifying spend for {:?}: {e:?}",
                         signed_spend.dbc_id()
                     )));
                 }
 
                 // If this is a storage payment, then verify FeeOutput's id is the expected.
-                verify_fee_output_id(&signed_spend.spent_tx())?;
+                verify_fee_output_id(&signed_spend.spent_tx(), false)?;
 
                 // Get parents
                 let mut parent_spends = BTreeSet::new();
@@ -480,9 +470,7 @@ impl Node {
                 }
 
                 // Check parents
-                if let Err(e) = check_parent_spends(&parent_spends, &signed_spend) {
-                    return Err(ProtocolError::InvalidSpendParents(format!("{e:?}")));
-                }
+                check_parent_spends(&parent_spends, &signed_spend)?;
 
                 // check the network if any spend has happened for the same dbc_id
                 // Does not return an error, instead the Vec<SignedSpend> is returned.
@@ -514,10 +502,15 @@ impl Node {
 // This requirement makes it possible for this output to be used as an input in a network
 // rewards/farming reclaiming TX, by making its spend location deterministic, analogous to
 // how an output DBC Id works for regular outputs.
-fn verify_fee_output_id(spent_tx: &DbcTransaction) -> Result<(), ProtocolError> {
+// If 'required' was set to 'true' then the fee output must be non-zero and valid.
+fn verify_fee_output_id(spent_tx: &DbcTransaction, required: bool) -> Result<(), ProtocolError> {
     let fee = &spent_tx.fee;
     info!(">>>> FEE: {fee:?}");
-    if !fee.is_free() {
+    if fee.is_free() {
+        if required {
+            return Err(ProtocolError::PaymentProofInvalidFeeOutput(fee.id));
+        }
+    } else {
         let mut fee_id_bytes = fee.root_hash.slice().to_vec();
         spent_tx
             .inputs
@@ -542,7 +535,7 @@ fn verify_fee_output_and_proof(
     path: &[usize],
 ) -> Result<(), ProtocolError> {
     // Check if the fee output id is correct
-    verify_fee_output_id(tx)?;
+    verify_fee_output_id(tx, true)?;
 
     // Check the root hash verifies the merkle-tree audit trail and path against the content address name
     let leaf_index = validate_payment_proof(addr_name, &tx.fee.root_hash, audit_trail, path)

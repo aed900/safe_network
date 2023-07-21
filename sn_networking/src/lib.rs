@@ -54,7 +54,7 @@ use sn_protocol::{
     NetworkAddress,
 };
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{HashMap, HashSet},
     net::SocketAddr,
     num::NonZeroUsize,
     path::PathBuf,
@@ -112,7 +112,6 @@ pub struct SwarmDriver {
     local: bool,
     /// A list of the most recent peers we have dialed ourselves.
     dialed_peers: CircularVec<PeerId>,
-    dead_peers: BTreeSet<PeerId>,
     is_client: bool,
 }
 
@@ -393,7 +392,6 @@ impl SwarmDriver {
             // 63 will mean at least 63 most recent peers we have dialed, which should be allow for enough time for the
             // `identify` protocol to kick in and get them in the routing table.
             dialed_peers: CircularVec::new(63),
-            dead_peers: Default::default(),
             is_client,
         };
 
@@ -484,17 +482,6 @@ impl Network {
     pub async fn start_listening(&self, addr: Multiaddr) -> Result<()> {
         let (sender, receiver) = oneshot::channel();
         self.send_swarm_cmd(SwarmCmd::StartListening { addr, sender })?;
-        receiver.await?
-    }
-
-    /// Dial the given peer at the given address.
-    pub async fn add_to_routing_table(&self, peer_id: PeerId, peer_addr: Multiaddr) -> Result<()> {
-        let (sender, receiver) = oneshot::channel();
-        self.send_swarm_cmd(SwarmCmd::AddToRoutingTable {
-            peer_id,
-            peer_addr,
-            sender,
-        })?;
         receiver.await?
     }
 

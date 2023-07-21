@@ -6,20 +6,25 @@
 // KIND, either express or implied. Please review the Licences for the specific language governing
 // permissions and limitations relating to use of the SAFE Network Software.
 
+mod common;
+
+use common::{get_client_and_wallet, get_funded_wallet};
+
 use safenode_proto::{safe_node_client::SafeNodeClient, NodeInfoRequest, RestartRequest};
 
+use assert_fs::TempDir;
 use bytes::Bytes;
 use eyre::{bail, eyre, Result};
 use rand::{rngs::OsRng, Rng};
-use sn_client::{get_tokens_from_genesis_to_another_wallet, Client, Error, Files};
+use sn_client::{Client, Error, Files, WalletClient};
 use sn_dbc::{Dbc, MainKey, Token};
 use sn_logging::{init_logging, LogFormat, LogOutputDest};
-use sn_peers_acquisition::parse_peer_addr;
 use sn_protocol::{
     storage::{ChunkAddress, DbcAddress, RegisterAddress},
     NetworkAddress,
 };
-use sn_transfers::dbc_genesis::{create_genesis_wallet, load_genesis_wallet};
+use sn_transfers::{dbc_genesis::create_genesis_wallet, wallet::LocalWallet};
+
 use std::{
     collections::{BTreeMap, VecDeque},
     fmt,
@@ -44,7 +49,7 @@ const NODE_COUNT: u32 = 25;
 
 const EXTRA_CHURN_COUNT: u32 = 5;
 const CHURN_CYCLES: u32 = 1;
-const CHUNK_CREATION_RATIO_TO_CHURN: u32 = 5;
+const CHUNK_CREATION_RATIO_TO_CHURN: u32 = 2;
 const REGISTER_CREATION_RATIO_TO_CHURN: u32 = 5;
 const DBC_CREATION_RATIO_TO_CHURN: u32 = 2;
 
@@ -56,6 +61,9 @@ const MAX_NUM_OF_QUERY_ATTEMPTS: u8 = 5;
 // Default total amount of time we run the checks for before reporting the outcome.
 // It can be overriden by setting the 'TEST_DURATION_MINS' env var.
 const TEST_DURATION: Duration = Duration::from_secs(60 * 60); // 1hr
+
+const PAYING_WALLET_INITIAL_BALANCE: u64 = 1_000_000;
+const TRANSFERS_WALLET_INITIAL_BALANCE: u64 = 2_000_000;
 
 type ContentList = Arc<RwLock<VecDeque<NetworkAddress>>>;
 type DbcMap = Arc<RwLock<BTreeMap<DbcAddress, Dbc>>>;
@@ -86,15 +94,15 @@ async fn data_availability_during_churn() -> Result<()> {
         TEST_DURATION
     };
 
-    let churn_period = if let Ok(str) = std::env::var("TEST_CHURN_CYCLES") {
+    let churn_period = if let Ok(str) = std::env::var("TEST_TOTAL_CHURN_CYCLES") {
+        println!("Using value set in 'TEST_TOTAL_CHURN_CYCLES' env var: {str}");
         let cycles = str.parse::<u32>()?;
-        test_duration / (cycles * NODE_COUNT)
+        test_duration / cycles
     } else {
         // Ensure at least some nodes got churned twice.
         test_duration / std::cmp::max(CHURN_CYCLES * NODE_COUNT, NODE_COUNT + EXTRA_CHURN_COUNT)
     };
-
-    println!("Nodes will churn every {:?}", churn_period);
+    println!("Nodes will churn every {churn_period:?}");
 
     // Create a cross thread usize for tracking churned nodes
     let churn_count = Arc::new(RwLock::new(0_usize));
@@ -121,8 +129,11 @@ async fn data_availability_during_churn() -> Result<()> {
         LogFormat::Default,
     )?;
 
-    println!("Creating a client...");
-    let client = get_client().await;
+    println!("Creating a client and paying wallet...");
+    let paying_wallet_dir = TempDir::new()?;
+    let (client, paying_wallet) =
+        get_client_and_wallet(paying_wallet_dir.path(), PAYING_WALLET_INITIAL_BALANCE).await?;
+
     println!("Client created with signing key: {:?}", client.signer_pk());
 
     // Shared bucket where we keep track of content created/stored on the network
@@ -134,10 +145,7 @@ async fn data_availability_during_churn() -> Result<()> {
     // Upload some chunks before carry out any churning.
 
     // Spawn a task to store Chunks at random locations, at a higher frequency than the churning events
-    store_chunks_task(client.clone(), content.clone(), churn_period);
-
-    // Wait one churn period _before_ we start churning, to get some data PUT on the network
-    sleep(churn_period).await;
+    store_chunks_task(client.clone(), paying_wallet, content.clone(), churn_period);
 
     // Spawn a task to churn nodes
     churn_nodes_task(churn_count.clone(), test_duration, churn_period);
@@ -154,7 +162,20 @@ async fn data_availability_during_churn() -> Result<()> {
     // at a higher frequency than the churning events
     if !chunks_only {
         create_registers_task(client.clone(), content.clone(), churn_period);
-        create_dbc_task(client.clone(), content.clone(), dbcs.clone(), churn_period);
+        let transfers_wallet_dir = TempDir::new()?;
+        let transfers_wallet = get_funded_wallet(
+            &client,
+            transfers_wallet_dir.path(),
+            TRANSFERS_WALLET_INITIAL_BALANCE,
+        )
+        .await?;
+        create_dbc_task(
+            client.clone(),
+            transfers_wallet,
+            content.clone(),
+            dbcs.clone(),
+            churn_period,
+        );
     }
 
     // Spawn a task to randomly query/fetch the content we create/store
@@ -190,7 +211,7 @@ async fn data_availability_during_churn() -> Result<()> {
 
     println!();
     println!(
-        "Test stopping after running for {:?}.",
+        ">>>>>> Test stopping after running for {:?}. <<<<<<",
         start_time.elapsed()
     );
     println!("{:?} churn events happened.", *churn_count.read().await);
@@ -237,7 +258,13 @@ async fn data_availability_during_churn() -> Result<()> {
 }
 
 // Spawns a task which periodically creates DBCs at random locations.
-fn create_dbc_task(client: Client, content: ContentList, dbcs: DbcMap, churn_period: Duration) {
+fn create_dbc_task(
+    client: Client,
+    transfers_wallet: LocalWallet,
+    content: ContentList,
+    dbcs: DbcMap,
+    churn_period: Duration,
+) {
     let _handle = tokio::spawn(async move {
         // Creating a genesis wallet first
         let _genesis_wallet = create_genesis_wallet().await;
@@ -245,21 +272,20 @@ fn create_dbc_task(client: Client, content: ContentList, dbcs: DbcMap, churn_per
         // Create Dbc at a higher frequency than the churning events
         let delay = churn_period / DBC_CREATION_RATIO_TO_CHURN;
 
+        let mut wallet_client = WalletClient::new(client.clone(), transfers_wallet);
+
         loop {
             sleep(delay).await;
 
-            let genesis_wallet = load_genesis_wallet().await;
-            let key = MainKey::random();
-            let dbc = get_tokens_from_genesis_to_another_wallet(
-                genesis_wallet,
-                Token::from_nano(100),
-                key.public_address(),
-                &client,
-            )
-            .await;
+            let dest_pk = MainKey::random().public_address();
+            let dbc = wallet_client
+                .send(Token::from_nano(10), dest_pk)
+                .await
+                .expect("Failed to send DBC to {dest_pk}");
+
             let dbc_addr = DbcAddress::from_dbc_id(&dbc.id());
             let net_addr = NetworkAddress::DbcAddress(dbc_addr);
-            println!("Created DBC at {net_addr:?} after {delay:?}");
+            println!("Created DBC at {dbc_addr:?} after {delay:?}");
             content.write().await.push_back(net_addr);
             let _ = dbcs.write().await.insert(dbc_addr, dbc);
         }
@@ -292,10 +318,16 @@ fn create_registers_task(client: Client, content: ContentList, churn_period: Dur
 }
 
 // Spawns a task which periodically stores Chunks at random locations.
-fn store_chunks_task(client: Client, content: ContentList, churn_period: Duration) {
+fn store_chunks_task(
+    client: Client,
+    paying_wallet: LocalWallet,
+    content: ContentList,
+    churn_period: Duration,
+) {
     let _handle = tokio::spawn(async move {
         // Store Chunks at a higher frequency than the churning events
         let delay = churn_period / CHUNK_CREATION_RATIO_TO_CHURN;
+        let mut wallet_client = WalletClient::new(client.clone(), paying_wallet);
 
         let file_api = Files::new(client);
         let mut rng = OsRng;
@@ -306,22 +338,33 @@ fn store_chunks_task(client: Client, content: ContentList, churn_period: Duratio
                 .collect();
             let bytes = Bytes::copy_from_slice(&random_bytes);
 
-            let addr = ChunkAddress::new(
-                file_api
-                    .calculate_address(bytes.clone())
-                    .expect("Failed to calculate new Chunk address"),
+            let (addr, chunks) = file_api
+                .chunk_bytes(bytes.clone())
+                .expect("Failed to chunk bytes");
+
+            println!(
+                "Paying storage for ({}) new Chunk/s of file ({} bytes) at {addr:?} in {delay:?}",
+                chunks.len(),
+                bytes.len()
             );
-            println!("Storing Chunk at {addr:?} in {delay:?}");
+            sleep(delay).await;
+            let proofs = wallet_client
+                .pay_for_storage(chunks.iter().map(|c| c.name()))
+                .await
+                .expect("Failed to pay for storage for new file at {addr:?}");
+
+            println!(
+                "Storing ({}) Chunk/s of file ({} bytes) at {addr:?} in {delay:?}",
+                chunks.len(),
+                bytes.len()
+            );
             sleep(delay).await;
 
-            match file_api
-                .upload_with_proof(bytes, &BTreeMap::default())
-                .await
-            {
+            match file_api.upload_with_proof(bytes, &proofs).await {
                 Ok(_) => content
                     .write()
                     .await
-                    .push_back(NetworkAddress::ChunkAddress(addr)),
+                    .push_back(NetworkAddress::ChunkAddress(ChunkAddress::new(addr))),
                 Err(err) => println!("Discarding new Chunk ({addr:?}) due to error: {err:?}"),
             }
         }
@@ -359,7 +402,7 @@ fn query_content_task(
                 }
                 Err(last_err) => {
                     println!(
-                        "Failed to query content (index: {index}) at {net_addr:?}: {last_err:?}"
+                        "Failed to query content (index: {index}) at {net_addr}: {last_err:?}"
                     );
                     // mark it to try 'MAX_NUM_OF_QUERY_ATTEMPTS' times.
                     let _ = content_erred
@@ -388,8 +431,9 @@ fn churn_nodes_task(
     let _handle = tokio::spawn(async move {
         let mut node_index = 1;
         let mut addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 12000);
-        let delay = churn_period;
         loop {
+            sleep(churn_period).await;
+
             // break out if we've run the duration of churn
             if start.elapsed() > test_duration {
                 println!("Test duration reached, stopping churn nodes task");
@@ -411,8 +455,6 @@ fn churn_nodes_task(
             if node_index > NODE_COUNT as u16 {
                 node_index = 1;
             }
-
-            sleep(delay).await;
         }
     });
 }
@@ -437,9 +479,9 @@ fn retry_query_content_task(
             if let Some((net_addr, mut content_error)) = erred {
                 let attempts = content_error.attempts + 1;
 
-                println!("Querying erred content at {net_addr:?}, attempt: #{attempts} ...");
+                println!("Querying erred content at {net_addr}, attempt: #{attempts} ...");
                 if let Err(last_err) = query_content(&client, &net_addr, dbcs.clone()).await {
-                    println!("Erred content is still not retrievable at {net_addr:?} after {attempts} attempts: {last_err:?}");
+                    println!("Erred content is still not retrievable at {net_addr} after {attempts} attempts: {last_err:?}");
                     // We only keep it to retry 'MAX_NUM_OF_QUERY_ATTEMPTS' times,
                     // otherwise report it effectivelly as failure.
                     content_error.attempts = attempts;
@@ -464,10 +506,10 @@ async fn final_retry_query_content(
 ) -> Result<()> {
     let mut attempts = 1;
     loop {
-        println!("Querying content at {net_addr:?}, attempt: #{attempts} ...");
+        println!("Querying content at {net_addr}, attempt: #{attempts} ...");
         if let Err(last_err) = query_content(client, net_addr, dbcs.clone()).await {
             if attempts == MAX_NUM_OF_QUERY_ATTEMPTS {
-                bail!("Final check: Content is still not retrievable at {net_addr:?} after {attempts} attempts: {last_err:?}");
+                bail!("Final check: Content is still not retrievable at {net_addr} after {attempts} attempts: {last_err:?}");
             } else {
                 attempts += 1;
                 let delay = 2 * churn_period;
@@ -551,24 +593,4 @@ async fn query_content(
         }
         _other => Ok(()), // we don't create/store any other type of content in this test yet
     }
-}
-
-async fn get_client() -> Client {
-    let secret_key = bls::SecretKey::random();
-
-    let bootstrap_peers = if !cfg!(feature = "local-discovery") {
-        match std::env::var("SAFE_PEERS") {
-            Ok(str) => match parse_peer_addr(&str) {
-                Ok(peer) => Some(vec![peer]),
-                Err(err) => panic!("Cann't parse SAFE_PEERS {str:?} with error {err:?}"),
-            },
-            Err(err) => panic!("Cann't get env var SAFE_PEERS with error {err:?}"),
-        }
-    } else {
-        None
-    };
-    println!("Client bootstrap with peer {bootstrap_peers:?}");
-    Client::new(secret_key, bootstrap_peers, None)
-        .await
-        .expect("Client shall be successfully created.")
 }

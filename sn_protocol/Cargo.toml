@@ -7,13 +7,14 @@ license = "GPL-3.0"
 name = "sn_protocol"
 readme = "README.md"
 repository = "https://github.com/maidsafe/safe_network"
-version = "0.2.9"
+version = "0.3.0"
 
 [dependencies]
 bls = { package = "blsttc", version = "8.0.1" }
 bytes = { version = "1.0.1", features = ["serde"] }
 crdts = { version = "7.3", default-features = false, features = ["merkle"] }
 custom_debug = "~0.5.0"
+hex = "~0.4.3" 
 libp2p = { version="0.52", features = ["identify", "kad"] }
 rmp-serde = "1.1.1"
 serde = { version = "1.0.133", features = [ "derive", "rc" ]}

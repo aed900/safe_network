@@ -274,11 +274,13 @@ impl SwarmDriver {
                     };
                     if is_wrong_id || is_all_connection_failed {
                         info!("Detected dead peer {peer_id:?}");
-                        if !self.dead_peers.contains(&peer_id) {
-                            let _ = self.dead_peers.insert(peer_id);
-                            self.send_event(NetworkEvent::PeerRemoved(peer_id));
+                        if let Some(dead_peer) =
+                            self.swarm.behaviour_mut().kademlia.remove_peer(&peer_id)
+                        {
+                            self.send_event(NetworkEvent::PeerRemoved(
+                                *dead_peer.node.key.preimage(),
+                            ));
                         }
-                        let _ = self.swarm.behaviour_mut().kademlia.remove_peer(&peer_id);
                         self.log_kbuckets(&peer_id);
                     }
                 }
@@ -370,9 +372,8 @@ impl SwarmDriver {
                         }
                         Err(err) => {
                             warn!("PutRecord task {id:?} completed with error {:?}.", err);
-                            // TODO: consider sending back the correct error
                             sender
-                                .send(Err(Error::RecordNotPut))
+                                .send(Err(err.into()))
                                 .map_err(|_| Error::InternalMsgChannelDropped)?;
                         }
                     }
@@ -419,9 +420,6 @@ impl SwarmDriver {
                 ..
             } => {
                 if is_new_peer {
-                    if self.dead_peers.remove(&peer) {
-                        info!("A dead peer {peer:?} joined back with the same ID");
-                    }
                     self.log_kbuckets(&peer);
                     self.send_event(NetworkEvent::PeerAdded(peer));
                     let connected_peers = self.swarm.connected_peers().count();

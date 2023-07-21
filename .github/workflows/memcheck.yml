@@ -27,7 +27,6 @@ jobs:
           sudo apt-get install -y heaptrack
   
       - name: Install Rust
-        id: toolchain
         uses: actions-rs/toolchain@v1
         with:
           profile: minimal
@@ -64,15 +63,39 @@ jobs:
             rg '/ip4.*$' -m1 -o | rg '"' -r '')
           echo "SAFE_PEERS=$safe_peers" >> $GITHUB_ENV
 
-      - name: Check SAFE_PEERS
+      - name: Check SAFE_PEERS was set
         shell: bash
-        run: echo "Contact peer is set to $SAFE_PEERS"
+        run: echo "The SAFE_PEERS variable has been set to $SAFE_PEERS"
 
       - name: Start a local network
-        run: cargo run --release --bin testnet -- --interval 2000 --node-path ./target/release/safenode
+        env:
+          SN_LOG: all
+        uses: maidsafe/sn-local-testnet-action@main
+        with:
+          action: start
+          interval: 2000
+          node-path: target/release/safenode
+          platform: "ubuntu-latest"
+          set-safe-peers: false
+
+      # In this case we did *not* want SAFE_PEERS to be set to another value by starting the testnet
+      - name: Check SAFE_PEERS was not changed
+        shell: bash
+        run: echo "The SAFE_PEERS variable has been set to $SAFE_PEERS"
+
+      - name: Start a faucet client to claim genesis
+        run: cargo run --bin faucet --release -- claim-genesis
         env:
           SN_LOG: "all"
-        timeout-minutes: 10
+        timeout-minutes: 2
+
+      - name: Create and fund a wallet to pay for files storage
+        run: |
+          cargo run --bin faucet --release -- send 500 $(cargo run --bin safe --release -- wallet address | tail -n 1) | tail -n 1 > dbc_hex
+          cat dbc_hex | cargo run --bin safe --release -- wallet deposit --stdin
+        env:
+          SN_LOG: "all"
+        timeout-minutes: 2
 
       # The resources file we upload may change, and with it mem consumption.
       # Be aware!
@@ -83,7 +106,6 @@ jobs:
           cargo run --bin safe --release -- files upload -- "./target/release/safe"
           cargo run --bin safe --release -- files upload -- "./target/release/safenode"
           cargo run --bin safe --release -- files upload -- "./target/release/testnet"
-        id: client-file-upload
         env:
           SN_LOG: "all"
         timeout-minutes: 10

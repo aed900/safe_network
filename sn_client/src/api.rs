@@ -280,11 +280,7 @@ impl Client {
     }
 
     /// Store `Chunk` as a record.
-    pub(super) async fn store_chunk(
-        &self,
-        chunk: Chunk,
-        payment: Option<PaymentProof>,
-    ) -> Result<()> {
+    pub(super) async fn store_chunk(&self, chunk: Chunk, payment: PaymentProof) -> Result<()> {
         info!("Store chunk: {:?}", chunk.address());
         let chunk_with_payment = ChunkWithPayment { chunk, payment };
         let record = Record {
@@ -340,14 +336,14 @@ impl Client {
             .await
             .map_err(|err| {
                 Error::CouldNotVerifyTransfer(format!(
-                    "Cann't find record for the dbc_id {dbc_id:?} with error {err:?}"
+                    "Can't find record for the dbc_id {dbc_id:?} with error {err:?}"
                 ))
             })?;
         debug!("Got record from the network, {:?}", record.key);
 
         let header = RecordHeader::from_record(&record).map_err(|err| {
             Error::CouldNotVerifyTransfer(format!(
-                "Cann't parse RecordHeader for the dbc_id {dbc_id:?} with error {err:?}"
+                "Can't parse RecordHeader for the dbc_id {dbc_id:?} with error {err:?}"
             ))
         })?;
 
@@ -355,7 +351,7 @@ impl Client {
             match try_deserialize_record::<Vec<SignedSpend>>(&record)
                 .map_err(|err| {
                     Error::CouldNotVerifyTransfer(format!(
-                        "Cann't deserialize record for the dbc_id {dbc_id:?} with error {err:?}"
+                        "Can't deserialize record for the dbc_id {dbc_id:?} with error {err:?}"
                     ))
                 })?
                 .as_slice()
